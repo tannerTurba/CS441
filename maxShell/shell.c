@@ -142,148 +142,6 @@ void redirect_out(char *file, int *saved_fd) {
 }
 
 /*
- * Creates a pipe for one command to use the output of another as input. 
- */
-void setup_pipe(char *argv2[], int *saved_fd) {
-	//create the pipe
-	int rc, fd[2] = {-1, -1};
-    pipe(fd);
-
-	//redirect the stdout to the right side of the pipe.
-	*saved_fd = dup(STDOUT_FILENO);
-	rc = dup2(fd[1], STDOUT_FILENO);
-	if(rc == -1) {
-		perror("Failed to create pipe");
-		exit(EXIT_FAILURE);
-	}
-    close(fd[1]);
-
-	//run to evaluate the right side. Reset stdout to original fd.
-    run(&argv2, &saved_fd);
-	reset_out(saved_fd);
-
-	//redirect the stdin to the right side of the pipe.
-	*saved_fd = dup(STDIN_FILENO);
-    rc = dup2(fd[0], STDIN_FILENO);
-	if(rc == -1) {
-		perror("Failed to create pipe");
-		exit(EXIT_FAILURE);
-	}
-    close(fd[0]);
-}
-
-void pipe2(char *p_args[], char *c_args[]) {
-	int rc, pipefd[2] = {-1, -1}, in_fd, out_fd;
-	pid_t pid;
-
-	rc = pipe(pipefd);
-	if(rc == -1) {
-		perror("Failed to create pipe");
-		exit(EXIT_FAILURE);
-	}
-
-	pid = fork();
-	switch(pid) {
-	case 0:
-		/* Child */
-		in_fd = dup(STDIN_FILENO);
-		rc = dup2(pipefd[0], STDIN_FILENO);
-		if(rc == -1) {
-			perror("Child failed to dup");
-			exit(EXIT_FAILURE);
-		}
-
-		close(pipefd[0]);
-		close(pipefd[1]);
-
-		//tr -d B
-		execvp(c_args[0], c_args);
-
-		// dup2(in_fd, STDIN_FILENO);
-		perror("Failed to exec");
-		exit(EXIT_FAILURE);
-	case -1:
-		perror("Failed to fork");
-		exit(EXIT_FAILURE);
-		break;
-	default:
-		/* Parent */
-		out_fd = dup(STDOUT_FILENO);
-		rc = dup2(pipefd[1], STDOUT_FILENO);
-		if (rc == -1) {
-			perror("Parent failed to dup");
-			exit(EXIT_FAILURE);
-		}
-
-		close(pipefd[0]);
-		close(pipefd[1]);
-
-		printf("ABC");
-
-		//echo ABC
-		// execvp(p_args[0], p_args);
-
-		dup2(out_fd, STDOUT_FILENO);
-		break;
-	}
-}
-
-/*
- * Responsible for forking and executing commands in the shell. 
- */
-void run(char * argv2[], int *saved_fd) {
-	int status;
-	pid_t pid = fork();
-
-	// continue depending on which process is active.
-	switch (pid) {
-		case 0: /* Child. */
-			//execute given command and its arguments
-			execvp(argv2[0], argv2);
-
-			//print if an error occurs
-			perror("error executing");
-			if(errno == 2) { /* Command does not exist */
-				exit(127);
-			}
-			else if(errno == 13) { /* Permission denied */
-				exit(126);
-			}
-			else {
-				exit(1);
-			}
-
-		case -1: /* Error. */
-			perror("Fork failed");
-			exit(EXIT_SUCCESS);
-
-		default: /* Parent. */
-			// If the second argument is "&" run in the background.
-			// if(argv2[1] != NULL && strcmp(argv2[1], "&") == 0) {
-			// 	continue;
-			// }
-
-			// After a process executes, print child exit code if exited.
-			waitpid(pid, &status, 0);
-			if(WIFEXITED(status)) {
-				int child_exit_code = WEXITSTATUS(status);
-				fprintf(stderr, "child exit code: %d\n", child_exit_code);
-			}
-
-			// Redirect input/output to original source.
-			if(output_redir_count == 1) {
-				reset_out(saved_fd);
-			}
-			else if(input_redir_count == 1) {
-				reset_in(saved_fd);
-			}
-			else if(pipe_count == 1) {
-				reset_in(saved_fd);
-			}
-	}
-}
-
-/*
  * Controls initial flow of logic and handles several user errors
  */
 int main (void) {
@@ -298,7 +156,8 @@ int main (void) {
 	
 	// loop indefinately: 
 	while (true) {
-		int count;
+		int count, rc, pipefd[2] = {-1, -1};
+		char *parent_args[CMD_MAX], *child_args[CMD_MAX];
 
 		// display prompt
 		fprintf(stderr, "$ ");
@@ -334,7 +193,7 @@ int main (void) {
 		
 		// Decide what to do with entered commands/arguments. 
 		if(argv2[0] != NULL) {
-			int j, saved_fd, should_continue = 1;
+			int j, saved_fd, should_continue = 1, out_fd, in_fd;
 			input_redir_count = 0, output_redir_count = 0, pipe_count = 0;
 
 			// Loop through the given args
@@ -389,21 +248,26 @@ int main (void) {
 						// argv2[j] = NULL;
 						// setup_pipe(argv2, &saved_fd);
 
-						char *parent_args[CMD_MAX], *child_args[CMD_MAX];
-						int p_index, c_index;
-						for(p_index = 0; p_index < j; p_index++) {
-							parent_args[p_index] = argv2[p_index];
+						int p_index = 0, c_index, args_index;
+						for(args_index = j + 1; args_index < count; args_index++) {
+							parent_args[p_index] = argv2[args_index];
+							p_index++;
 						}
-						for(c_index = j + 1; c_index < count; c_index++) {
+						
+						for(c_index = 0; c_index < j; c_index++) {
 							child_args[c_index] = argv2[c_index];
 						}
-						pipe2(&parent_args, &child_args);
-						should_continue = 0;
+						rc = pipe(pipefd);
+						if (-1 == rc) {
+							perror("Failed to create pipe");
+							goto done;
+						}
+						pipe_count = 1;
 					}
 				}
 			}
-			
-			// if redirection or piping is not used, execute given command. 
+
+			// execute given command. 
 			if (strcmp(argv2[0], "exit") == 0) {
 				return 0;
 			}
@@ -418,15 +282,100 @@ int main (void) {
 				fprintf(stderr, "cannot use '&' without preceding command\n");
 			}
 			else if(should_continue) {
-				run(argv2, &saved_fd);
+				int status;
+				pid_t pid = fork();
+
+				// continue depending on which process is active.
+				switch (pid) {
+					case 0: /* Child. */
+						if(pipe_count) {
+							out_fd = dup(STDOUT_FILENO);
+							rc = dup2(pipefd[1], STDOUT_FILENO);
+							if(rc == -1) {
+								perror("Child failed to create pipe");
+								goto done;
+							}
+
+							// close pipefd's and execute the left side of the pipe.
+							close(pipefd[0]);
+							close(pipefd[1]);
+							execvp(child_args[0], child_args);
+						}
+						else {
+							//execute given command and its arguments.
+							execvp(argv2[0], argv2);
+						}
+						
+						//print if an error occurs
+						perror("error executing");
+						if(errno == 2) { /* Command does not exist */
+							exit(127);
+						}
+						else if(errno == 13) { /* Permission denied */
+							exit(126);
+						}
+						else {
+							exit(1);
+						}
+
+					case -1: /* Error. */
+						perror("Fork failed");
+						goto done;
+
+					default: /* Parent. */
+						pid_t pid2;
+						if(pipe_count) {
+							pid2 = fork();
+							pipe_count = 0;
+							switch (pid2) {
+								case 0: /* Child */
+									rc = dup2(pipefd[0], STDIN_FILENO);
+									if(rc == -1) {
+										perror("Parent failed to create pipe");
+										goto done;
+									} 
+
+									// close the pipefd's and execute the right side of the pipe.
+									close(pipefd[0]);
+									close(pipefd[1]);
+									execvp(parent_args[0], parent_args);
+								case -1: /* Error */
+									perror("Fork failed");
+									goto done;
+							}
+						}
+
+						// If the second argument is "&" run in the background.
+						if(argv2[1] != NULL && strcmp(argv2[1], "&") == 0) {
+							continue;
+						}
+
+						// Redirect input/output to original source.
+						if(output_redir_count == 1) {
+							reset_out(&saved_fd);
+						}
+						else if(input_redir_count == 1) {
+							reset_in(&saved_fd);
+						}
+						else if(pipe_count == 1) {
+							close(pipefd[0]);
+							close(pipefd[1]);
+						}
+
+						// After a process executes, print child exit code if exited.
+						waitpid(pid, &status, 0);
+						if(WIFEXITED(status)) {
+							int child_exit_code = WEXITSTATUS(status);
+							fprintf(stderr, "child exit code: %d\n", child_exit_code);
+						}
+				}
 			}
 		}
+	}
 	}
 	exit(EXIT_SUCCESS);
 
 done:
 	exit(EXIT_FAILURE);
-}
-
 }
 
